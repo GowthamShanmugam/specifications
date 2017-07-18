@@ -1,0 +1,301 @@
+:imagesdir: ./images
+
+= Re-arichitecturing tendrl alerting system
+
+Alerting is essential to spot the problem and notify it to the corresponding user.
+Tendrl alerting system will raise alerts when thresholds reaches maximum capacity or
+brick goes down or disk goes down etc.  All the alerts are notified to the user
+using different channels.
+
+
+== Problem description
+
+Currently,  Tendrl getting alert from two different components collectd and integrations.
+Collectd will raise all threshold related alerts and integrations will raise all other
+cluster related alerts. Because of new change only grafana is going to raise all threshold
+related alerts. So instead of collectd tendrl should able to catch all alerts which is
+raised from grafana and convert the alert into current alert structure and pass that to
+alerting module. Alerting module should find all dependent alert for that particular alert
+and sent as a single notification to the users.
+
+For example: If brick fail alert came it has to check whether disk is failed or not.
+
+These dependent alerts are specific to each alerts.
+
+Note:  Alerting module required change like find dependent alert and sent all
+those alert as single notification to the users, other than this there is no change
+in reading alert from etcd and storing alerting in etcd.
+
+
+== Proposed change
+
+Tendrl needs some endpoint to receive alerts from grafana. Grafana will	send alerts
+based on already configured notification channels. For now tendrl alerting end point
+should be a localhost.
+
+When performance monitoring start then alerting end point will ready to receive
+the alerts from grafana. If any alert raises then grafana will send the alert to
+the end point. After receiving alerts it should be converted to current alert structure
+of tednrl. Received grafana alert have very limited details about alert. So it should
+sent api request to grafana using alert id to get more details about alert.
+
+```
+Received grafana alert:
+
+    {
+      "evalMatches":[
+        {
+          "value":6961614848,
+          "metric":"collectd.dhcp42-170_lab_eng_blr_redhat_com.memory.memory-free","tags":null
+        }
+      ],
+      "message":"alert",
+      "ruleId":6,
+      "ruleName":"Panel Title alert",
+      "ruleUrl":"http://localhost:3000/dashboard/db/new_graphite?fullscreen\u0026edit\u0026tab=alert\u0026panelId=3\u0026orgId=1",
+      "state":"alerting",
+      "title":"[Alerting] Panel Title alert"
+    }
+
+Alert from API request: http://{ip}:3000/api/alerts/6
+
+{
+Id: 6,
+Version: 0,
+OrgId: 1,
+DashboardId: 7,
+PanelId: 3,
+Name: "Panel Title alert",
+Message: "alert",
+Severity: "",
+State: "alerting",
+Handler: 1,
+Silenced: false,
+ExecutionError: " ",
+Frequency: 5,
+EvalData: - {
+evalMatches: - [
+- {
+metric: "collectd.dhcp42-170_lab_eng_blr_redhat_com.memory.memory-free",
+tags: null,
+value: 6961614848
+}
+]
+},
+NewStateDate: "2017-07-18T23:07:16+05:30",
+StateChanges: 291,
+Created: "2017-09-18T14:36:37+05:30",
+Updated: "2017-07-19T04:37:11+05:30",
+Settings: - {
+conditions: - [
+- {
+evaluator: - {
+params: - [
+6956963696
+],
+type: "gt"
+},
+operator: - {
+type: "and"
+},
+query: - {
+datasourceId: 3,
+model: - {
+refId: "A",
+target: "collectd.dhcp42-170_lab_eng_blr_redhat_com.memory.memory-free"
+},
+params: - [
+"A",
+"5m",
+"now"
+]
+},
+reducer: - {
+params:[],
+type: "avg"
+},
+type: "query"
+}
+],
+executionErrorState: "alerting",
+frequency: "5s",
+handler: 1,
+message: "alert",
+name: "Panel Title alert",
+noDataState: "alerting",
+notifications:[]
+}
+}
+
+```
+
+After receiving alert then it will converted to current tendrl alert structure.
+```
+Alert_id
+node_id
+time_stamp
+resource
+current_value
+tags
+alert_type
+severity
+significance
+ackedby
+acked
+ack_comment
+acked_at
+pid
+source
+```
+
+After that alert is stored as a metadata for message object and pushed into message socket.
+Alerting module will take the alert from message socket and call particular alert handler
+function using resource variable in alert structure. Each alert handler have subfunction
+to find the dependent alert of the particular alert. After that alerts are stored
+in etcd and  passed to notifier to notify the user.
+
+Note: if performance monitoring goes down then tendrl can’t receive the alert from grafana.
+So when performance monitoring comes back it has to send api request to grafana to fetch
+all the alert which have state like alerting or ok. All those alerts are converted to
+current alert structure and send to message socket. If any alert with alert id already
+exist then it is updated else it created as a new alert. Notification will send Only
+for new alerts and state changed alerts.
+
+image::tendrl_alerting_system.png[Tendrl Alerting System]
+
+=== Alternatives:
+
+None
+
+=== Data model impact:
+
+No changes in existing structure.
+
+=== Impacted Modules:
+
+==== Tendrl API impact:
+
+None
+
+==== Notifications/Monitoring impact:
+
+None
+
+==== Tendrl/common impact:
+None
+
+==== Tendrl/node_agent impact:
+
+None
+
+==== Sds integration impact:
+None
+
+==== Tendrl/performance-monitoring impact:
+
+Create a new class called alert_handler and run this class as separate gevent.
+AlertHandler will receive the alert event from socket and convert that alert as
+dictionary based on current alert structure and pass the alert as a message into
+message socket. (more details in implementation section)
+
+Whenever performance monitoring is restarted AlertHandler will send api request to
+grafana to fetch all the alerts which are all have state like ‘alerting’ and ‘ok’.
+Convert all fetched alerts and send that as messages into message socket.
+
+```
+To fetch all alerts from grafana:
+   http://{ip}:3000/api/alerts
+```
+
+==== Tendrl/alerting impact:
+
+**Existing flow:**
+Alerting module will fetch alert from etcd under the path messages/event which are all have
+priority called ‘notice’. Then convert the alert dictionary from message metadata into alert object.
+Using resource attribute alert is passed to particular alert handler. Alert handler will format
+the alert into particular format and It will store the alert into etcd.
+
+**Additional Flow:**
+When particular alert handler receives the alert then it will find all dependent alert.
+It will combine those alert as a single alert and give that to notifier to notify the user.
+In alerting module create a new directory called dependent_alert and create each dependent
+alerts as a separate file.  Any alert can find its dependent alert using these files.
+It will avoid any repetition in finding any dependency alerts between all main alerts.
+
+=== Security impact:
+
+None
+
+=== Other end user impact:
+
+Alerts and dependent alerts are received by end user as single alert.
+
+=== Performance impact:
+
+* When performance monitoring goes down then tendrl can’t receive any alert event
+from grafana.So we have a flow like when performance monitoring  comes back it will
+fetch all alerts from grafana and sent all alerts as messages to message socket.
+So the alerting module will take alerts from etcd path message/events and raise notification
+only for new alerts and state changed alerts. Problem in this approach is we need to check
+all collected alerts from messages with alerts which is in /alerting/alerts to find which
+is new alerts and which alerts states are changes. Other wise notification will send for all alert.
+* Reading all alerting event from grafana and storing all in etcd will dump etcd.
+But it will happen only performance monitoring restarted. To find all missed events this the way.
+
+=== Other deployer impact:
+
+None
+
+=== Developer impact:
+
+Need to create a end point to receive alerting event from grafana. Convert that alert
+event into current alerting structure. And pass the alert into message socket.
+Enhance the alert handlert to find dependent alerts and  sent all those alerts as a
+single notification to the users.
+
+== Implementation:
+* Create a new file called handler.py in performance monitoring.
+* Create a new class called AlertHandler in handler.py
+* Run AlertHandler as seperate gevent from performance monitoring manager.
+* Create a function called ‘to_dict’ in AlertHandler to convert the received alert into dictionary based on current tendrl alert structure.
+* Create a new function called ‘fetch_alerts’ in AlertHander to fetch all alerts which are all have state like alerting or ok from grafana. This function will call only when performance monitoring start or restart.
+* Create a new message object using alert dictionary as metadata.
+* Pass the message object into message socket using Event class.
+* Create a new directory called dependent_alerts in alerting module.
+* Create a different file to find each dependent alert.
+* Call the required dependent alert from each alert handler.
+* Combine alert and all dependent alerts and send as a single notification.
+
+Note:
+    There no changes in tacking alert from events and process alert in alerting module.
+
+
+=== Assignee(s):
+
+Rishubh jain
+Gowtham S
+
+
+=== Work Items:
+
+https://github.com/Tendrl/specifications/issues/169
+
+
+== Dependencies:
+
+None
+
+
+== Testing:
+
+Check all grafana and sds alerts are stored and notified to the users correctly.
+
+
+== Documentation impact:
+
+None
+
+
+== References:
+
+None
