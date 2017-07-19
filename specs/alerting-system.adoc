@@ -11,6 +11,7 @@ Grafana has been introduced to display interactive graphs for monitoring data fo
 == Use Cases
 
 Goal: Notify user when the system crosses threshold.
+
 Actors:
 
 1) User 
